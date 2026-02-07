@@ -24,7 +24,7 @@ public interface ITokenHandler
     /// <param name="ct">Cancellation token</param>
     /// <returns>Token string and expiration time in seconds</returns>
     Task<(string Token, int ExpiresInSeconds)> CreateAccessTokenAsync(Guid userId, string username, CancellationToken ct = default);
-    
+
     /// <summary>
     /// Retrieves an existing valid token for a user from Redis cache
     /// </summary>
@@ -32,7 +32,7 @@ public interface ITokenHandler
     /// <param name="ct">Cancellation token</param>
     /// <returns>Existing token and expiration, or null if not found</returns>
     Task<(string Token, int ExpiresInSeconds)?> GetExistingTokenAsync(Guid userId, CancellationToken ct = default);
-    
+
     /// <summary>
     /// Revokes a token by removing it from Redis cache
     /// </summary>
@@ -49,7 +49,7 @@ public sealed class TokenHandler : ITokenHandler
     private readonly JwtOptions _jwt;
     private readonly RedisOptions _redisOptions;
     private readonly IDatabase _redis;
-    
+
     /// <summary>
     /// Initializes a new instance of the TokenHandler
     /// </summary>
@@ -65,13 +65,38 @@ public sealed class TokenHandler : ITokenHandler
         _redisOptions = redisOptions.Value;
         _redis = mux.GetDatabase();
     }
-    
+
     /// <inheritdoc />
     public async Task<(string Token, int ExpiresInSeconds)> CreateAccessTokenAsync(
         Guid userId,
         string username,
         CancellationToken ct)
     {
+        // Check for and revoke any existing valid token for this user before creating a new one
+        var userTokenKey = $"{_redisOptions.InstancePrefix}user:{userId}:token";
+        var existingTokenStr = await _redis.StringGetAsync(userTokenKey);
+
+        if (!existingTokenStr.IsNullOrEmpty)
+        {
+            try
+            {
+                // Attempt to parse the old token to get its JTI for revocation
+                var handler = new JwtSecurityTokenHandler();
+                if (handler.CanReadToken(existingTokenStr))
+                {
+                    var jwtToken = handler.ReadJwtToken(existingTokenStr);
+                    if (!string.IsNullOrEmpty(jwtToken.Id))
+                    {
+                        await RevokeAsync(jwtToken.Id, ct);
+                    }
+                }
+            }
+            catch
+            {
+                // If we can't parse the old token, we can't revoke it safely by JTI. 
+            }
+        }
+
         var now = DateTime.UtcNow;
         var expires = now.AddMinutes(_jwt.ExpirationMinutes);
 
@@ -85,7 +110,7 @@ public sealed class TokenHandler : ITokenHandler
             new(JwtRegisteredClaimNames.UniqueName, username),
             new(JwtRegisteredClaimNames.Jti, jti),
             new(JwtRegisteredClaimNames.Iat, ToUnixTimeSeconds(now).ToString(), ClaimValueTypes.Integer64),
-            
+
             new(ClaimTypes.NameIdentifier, userId.ToString()),
             new(ClaimTypes.Name, username)
         };
@@ -108,13 +133,12 @@ public sealed class TokenHandler : ITokenHandler
 
         // Store token in Redis with TTL
         var ttl = TimeSpan.FromMinutes(_jwt.ExpirationMinutes);
-        
+
         // Store by JTI for token validation
         var jtiKey = $"{_redisOptions.InstancePrefix}token:{jti}";
         await _redis.StringSetAsync(jtiKey, userId.ToString(), ttl);
-        
+
         // Store by user ID for retrieving existing tokens
-        var userTokenKey = $"{_redisOptions.InstancePrefix}user:{userId}:token";
         await _redis.StringSetAsync(userTokenKey, token, ttl);
 
         return (token, (int)ttl.TotalSeconds);
@@ -137,7 +161,7 @@ public sealed class TokenHandler : ITokenHandler
 
         return (existingToken.ToString(), (int)ttl.Value.TotalSeconds);
     }
-    
+
     /// <inheritdoc />
     public async Task RevokeAsync(string jti, CancellationToken ct)
     {
